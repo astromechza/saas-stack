@@ -1,0 +1,102 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - 5432:5432
+    volumes:
+      - saas-stack-postgres:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=P@ssw0rd
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d postgres -U root"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+  postgres-init:
+    image: postgres:16-alpine
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -ex
+        pexec() {
+          psql -h postgres -p 5432 -d postgres -U root -c "$1"
+        }
+        for db in spicedb; do
+          pexec "SELECT 1 FROM pg_database WHERE datname = '$$db'" | grep -q 1 || pexec "create database $$db"
+        done
+    environment:
+      - PGPASSWORD=P@ssw0rd
+    depends_on:
+      postgres:
+        condition: service_healthy
+  
+  # BIG NOTE: unfortunately - vault is not fun to administer in docker compose when backed by postgres because you have to not forget the root token and unseal key, store it
+  # in secret management, and then useal whenever you start it up. 
+  # Running this in Fly.io would be somewhat worth it though since we can run a separate process to do the unseal with a fly secret passed in.
+  vault:
+    image: vault:1.13.3
+    command:
+      - server
+      - -dev
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - 48200:8200
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=myroot
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+    healthcheck:
+      test: ["CMD-SHELL", "wget -O - http://localhost:8200"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+
+  spicedb-migrate:
+    image: authzed/spicedb:v1.28.0
+    command:
+      - migrate
+      - head
+    environment:
+      - SPICEDB_DATASTORE_ENGINE=postgres
+      - SPICEDB_DATASTORE_CONN_URI=postgres://root:P@ssw0rd@postgres:5432/spicedb?sslmode=disable
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+
+  spicedb:
+    image: authzed/spicedb:v1.28.0
+    command:  
+      - serve
+      - --http-enabled
+    ports:
+      - 58443:8443
+      - 50051:50051
+    environment:
+      - SPICEDB_GRPC_PRESHARED_KEY=some-key
+      - SPICEDB_DATASTORE_ENGINE=postgres
+      - SPICEDB_DATASTORE_CONN_URI=postgres://root:P@ssw0rd@postgres:5432/spicedb?sslmode=disable
+    # annoyingly the container doesn't seem to have a curl or shell or anything so this won't work in compose
+    healthcheck: {}
+    depends_on:
+      spicedb-migrate:
+        condition: service_completed_successfully
+
+  wait:
+    image: alpine:3
+    command: echo
+    depends_on:
+      spicedb:
+        condition: service_started
+      vault:
+        condition: service_healthy
+
+volumes:
+  saas-stack-postgres: {}
